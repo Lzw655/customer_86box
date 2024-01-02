@@ -24,7 +24,7 @@
 #define RGB_LVGL_AVOID_TEARING_MODE_1       (2)
 #define RGB_LVGL_AVOID_TEARING_MODE_2       (3)
 
-#define RGB_LVGL_AVOID_TEARING_MODE         (RGB_LVGL_AVOID_TEARING_MODE_2)
+#define RGB_LVGL_AVOID_TEARING_MODE         (RGB_LVGL_AVOID_TEARING_MODE_1)
 
 #if RGB_LVGL_AVOID_TEARING_MODE == RGB_LVGL_AVOID_TEARING_MODE_NONE
     #define CONFIG_BSP_LCD_RGB_BUFFER_NUMS            (1)
@@ -158,9 +158,9 @@ typedef enum {
  */
 static lv_port_flush_probe_t flush_copy_probe(lv_disp_drv_t *drv)
 {
-    static lv_port_flush_status_t prev_status = FLUSH_PROBE_PART_COPY;
+    static lv_port_flush_status_t prev_status = FLUSH_STATUS_PART;
     lv_port_flush_status_t cur_status;
-    uint8_t probe_result;
+    lv_port_flush_probe_t probe_result;
     lv_disp_t *disp_refr = _lv_refr_get_disp_refreshing();
 
     uint32_t flush_ver = 0;
@@ -317,8 +317,8 @@ static void flush_dirty_copy(void *dst, void *src, lv_port_dirty_area_t *dirty_a
             y_end = dirty_area->inv_areas[i].y2 + 1;
 
             copy_bytes_per_line = (x_end - x_start) * 2;
-            from = src + (y_start * h_res + x_start) * 2;
-            to = dst + (y_start * h_res + x_start) * 2;
+            from = (uint8_t *)src + (y_start * h_res + x_start) * 2;
+            to = (uint8_t *)dst + (y_start * h_res + x_start) * 2;
             for (int y = y_start; y < y_end; y++) {
                 memcpy(to, from, copy_bytes_per_line);
                 from += bytes_per_line;
