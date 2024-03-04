@@ -4,3 +4,6 @@
 [submodule "libraries/ESP32_IO_Expander"]
 	path = libraries/ESP32_IO_Expander
 	url = https://github.com/esp-arduino-libs/ESP32_IO_Expander.git
+[submodule "libraries/lvgl"]
+	path = libraries/lvgl
+	url = https://github.com/lvgl/lvgl.git
