@@ -4,63 +4,26 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <Arduino.h>
-#include <ESP_Panel_Library.h>
-#include "esp_err.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+#include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_log.h"
+#include "ESP_Panel_Library.h"
 #include "lvgl.h"
-#include "bsp_err_check.h"
-#include "bsp_lvgl_port.h"
+#include "lvgl_port.h"
 
-/* LVGL porting configurations */
-#define LVGL_TASK_MAX_DELAY_MS                      (500)
-#define LVGL_TASK_MIN_DELAY_MS                      (2)
-#define CONFIG_BSP_DISPLAY_LVGL_TASK_STACK_SIZE_KB  (4)
-#define CONFIG_BSP_DISPLAY_LVGL_TASK_PRIORITY       (2)
-#define CONFIG_BSP_DISPLAY_LVGL_TASK_CORE_ID        (-1)
+static const char *TAG = "lvgl_port_v8";
+static SemaphoreHandle_t lvgl_mux = nullptr;                  // LVGL mutex
+static TaskHandle_t lvgl_task_handle = nullptr;
 
-#define RGB_LVGL_AVOID_TEARING_MODE_NONE    (0)
-#define RGB_LVGL_AVOID_TEARING_MODE_0       (1)
-#define RGB_LVGL_AVOID_TEARING_MODE_1       (2)
-#define RGB_LVGL_AVOID_TEARING_MODE_2       (3)
-
-#define RGB_LVGL_AVOID_TEARING_MODE         (RGB_LVGL_AVOID_TEARING_MODE_1)
-
-#if RGB_LVGL_AVOID_TEARING_MODE == RGB_LVGL_AVOID_TEARING_MODE_NONE
-    #define CONFIG_BSP_LCD_RGB_BUFFER_NUMS            (1)
-#else
-    #define CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR      (1)
-#if RGB_LVGL_AVOID_TEARING_MODE == RGB_LVGL_AVOID_TEARING_MODE_0
-    #define CONFIG_BSP_LCD_RGB_BUFFER_NUMS                    (2)
-    #define CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH    (1)
-#elif RGB_LVGL_AVOID_TEARING_MODE == RGB_LVGL_AVOID_TEARING_MODE_1
-    #define CONFIG_BSP_LCD_RGB_BUFFER_NUMS                    (2)
-    #define CONFIG_BSP_DISPLAY_LVGL_DIRECT_MODE     (1)
-#elif RGB_LVGL_AVOID_TEARING_MODE == RGB_LVGL_AVOID_TEARING_MODE_2
-    #define CONFIG_BSP_LCD_RGB_BUFFER_NUMS                    (3)
-    #define CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH    (1)
-#else
-#error "Invalid RGB LVGL mode, please set macro `RGB_LVGL_AVOID_TEARING_MODE` to one of `RGB_LVGL_AVOID_TEARING_MODE_*`"
-#endif
-#endif
-
-#define CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE     (0)
-
-#define BSP_LCD_H_RES       (ESP_PANEL_LCD_H_RES)
-#define BSP_LCD_V_RES       (ESP_PANEL_LCD_V_RES)
-
-static const char *TAG = "bsp_lvgl_port";
-static SemaphoreHandle_t lvgl_mux;                  // LVGL mutex
-static TaskHandle_t lvgl_task_handle = NULL;
-static ESP_Panel panel;
-
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE != 0
+#if LVGL_PORT_ROTATION_DEGREE != 0
 static void *get_next_frame_buffer(esp_lcd_panel_handle_t panel_handle)
 {
     static void *next_fb = NULL;
     static void *fb[2] = { NULL };
     if (next_fb == NULL) {
-        BSP_ERROR_CHECK_RETURN_NULL(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &fb[0], &fb[1]));
+        ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &fb[0], &fb[1]));
         next_fb = fb[1];
     } else {
         next_fb = (next_fb == fb[0]) ? fb[1] : fb[0];
@@ -117,10 +80,10 @@ IRAM_ATTR static void rotate_copy_pixel(const uint16_t *from, uint16_t *to, uint
         break;
     }
 }
-#endif /* CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE */
+#endif /* LVGL_PORT_ROTATION_DEGREE */
 
-#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
-#if CONFIG_BSP_DISPLAY_LVGL_DIRECT_MODE
+#if LVGL_PORT_AVOID_TEAR
+#if LVGL_PORT_DIRECT_MODE
 typedef struct {
     uint16_t inv_p;
     uint8_t inv_area_joined[LV_INV_BUF_SIZE];
@@ -189,8 +152,8 @@ static lv_port_flush_probe_t flush_copy_probe(lv_disp_drv_t *drv)
     return probe_result;
 }
 
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE != 0
-static inline void *flush_get_next_buf(void *panel_handle)
+#if LVGL_PORT_ROTATION_DEGREE != 0
+static inline void *flush_get_next_buf(esp_lcd_panel_handle_t panel_handle)
 {
     return get_next_frame_buffer(panel_handle);
 }
@@ -212,7 +175,8 @@ static void flush_dirty_copy(void *dst, void *src, lv_port_dirty_area_t *dirty_a
             y_start = dirty_area->inv_areas[i].y1;
             y_end = dirty_area->inv_areas[i].y2;
 
-            rotate_copy_pixel(src, dst, x_start, y_start, x_end, y_end, LV_HOR_RES, LV_VER_RES, CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE);
+            rotate_copy_pixel((uint16_t *)src, (uint16_t *)dst, x_start, y_start, x_end, y_end, LV_HOR_RES, LV_VER_RES,
+                              (lv_disp_rot_t)LVGL_PORT_ROTATION_DEGREE_TYPE);
         }
     }
 }
@@ -236,10 +200,11 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
 
             // Roate and copy data from the whole screen LVGL's buffer to the next frame buffer
             next_fb = flush_get_next_buf(panel_handle);
-            rotate_copy_pixel((uint16_t *)color_map, next_fb, offsetx1, offsety1, offsetx2, offsety2, LV_HOR_RES, LV_VER_RES, CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE);
+            rotate_copy_pixel((uint16_t *)color_map, (uint16_t *)next_fb, offsetx1, offsety1, offsetx2, offsety2,
+                              LV_HOR_RES, LV_VER_RES, LVGL_PORT_ROTATION_DEGREE_TYPE);
 
             /* Switch the current RGB frame buffer to `next_fb` */
-            panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
+            esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
 
             /* Waiting for the current frame buffer to complete transmission */
             ulTaskNotifyValueClear(NULL, ULONG_MAX);
@@ -269,7 +234,7 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
                 flush_dirty_copy(next_fb, color_map, &dirty_area);
 
                 /* Switch the current RGB frame buffer to `next_fb` */
-                panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
+                esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
 
                 /* Waiting for the current frame buffer to complete transmission */
                 ulTaskNotifyValueClear(NULL, ULONG_MAX);
@@ -345,7 +310,7 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
             drv->full_refresh = 0;
 
             /* Switch the current RGB frame buffer to `color_map` */
-            panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+            esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
 
             /* Waiting for the last frame buffer to complete transmission */
             ulTaskNotifyValueClear(NULL, ULONG_MAX);
@@ -370,7 +335,7 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
                 lv_refr_now(_lv_refr_get_disp_refreshing());
             } else {
                 /* Switch the current RGB frame buffer to `color_map` */
-                panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+                esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
 
                 /* Waiting for the last frame buffer to complete transmission */
                 ulTaskNotifyValueClear(NULL, ULONG_MAX);
@@ -387,9 +352,9 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
 
     lv_disp_flush_ready(drv);
 }
-#endif /* CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE */
+#endif /* LVGL_PORT_ROTATION_DEGREE */
 
-#elif CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH && CONFIG_BSP_LCD_RGB_BUFFER_NUMS == 2
+#elif LVGL_PORT_FULL_REFRESH && LVGL_PORT_DISP_BUFFER_NUM == 2
 
 static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color_map)
 {
@@ -400,7 +365,7 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
     const int offsety2 = area->y2;
 
     /* Switch the current RGB frame buffer to `color_map` */
-    panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
 
     /* Waiting for the last frame buffer to complete transmission */
     ulTaskNotifyValueClear(NULL, ULONG_MAX);
@@ -409,9 +374,9 @@ static void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t
     lv_disp_flush_ready(drv);
 }
 
-#elif CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH && CONFIG_BSP_LCD_RGB_BUFFER_NUMS == 3
+#elif LVGL_PORT_FULL_REFRESH && LVGL_PORT_DISP_BUFFER_NUM == 3
 
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE == 0
+#if LVGL_PORT_ROTATION_DEGREE == 0
 static void *lvgl_port_rgb_last_buf = NULL;
 static void *lvgl_port_rgb_next_buf = NULL;
 static void *lvgl_port_flush_next_buf = NULL;
@@ -425,21 +390,22 @@ void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color
     const int offsety1 = area->y1;
     const int offsety2 = area->y2;
 
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE != 0
+#if LVGL_PORT_ROTATION_DEGREE != 0
     void *next_fb = get_next_frame_buffer(panel_handle);
 
     /* Rotate and copy dirty area from the current LVGL's buffer to the next RGB frame buffer */
-    rotate_copy_pixel((uint16_t *)color_map, next_fb, offsetx1, offsety1, offsetx2, offsety2, LV_HOR_RES, LV_VER_RES, CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE);
+    rotate_copy_pixel((uint16_t *)color_map, (uint16_t *)next_fb, offsetx1, offsety1, offsetx2, offsety2, LV_HOR_RES,
+                      LV_VER_RES, LVGL_PORT_ROTATION_DEGREE_TYPE);
 
     /* Switch the current RGB frame buffer to `next_fb` */
-    panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
+    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, next_fb);
 #else
     drv->draw_buf->buf1 = color_map;
     drv->draw_buf->buf2 = lvgl_port_flush_next_buf;
     lvgl_port_flush_next_buf = color_map;
 
     /* Switch the current RGB frame buffer to `color_map` */
-    panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
 
     lvgl_port_rgb_next_buf = color_map;
 #endif
@@ -448,10 +414,10 @@ void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color
 }
 #endif
 
-static bool lcd_trans_done(void *arg)
+bool lvgl_port_notify_rgb_vsync(void)
 {
     BaseType_t need_yield = pdFALSE;
-#if CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH && (CONFIG_BSP_LCD_RGB_BUFFER_NUMS == 3) && (CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE == 0)
+#if LVGL_PORT_FULL_REFRESH && (LVGL_PORT_DISP_BUFFER_NUM == 3) && (LVGL_PORT_ROTATION_DEGREE == 0)
     if (lvgl_port_rgb_next_buf != lvgl_port_rgb_last_buf) {
         lvgl_port_flush_next_buf = lvgl_port_rgb_last_buf;
         lvgl_port_rgb_last_buf = lvgl_port_rgb_next_buf;
@@ -474,13 +440,12 @@ void flush_callback(lv_disp_drv_t *drv, const lv_area_t *area, lv_color_t *color
     const int offsety2 = area->y2;
 
     /* Just copy data from the color map to the RGB frame buffer */
-    panel.getLcd()->drawBitmap(offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
+    esp_lcd_panel_draw_bitmap(panel_handle, offsetx1, offsety1, offsetx2 + 1, offsety2 + 1, color_map);
 
     lv_disp_flush_ready(drv);
 }
 
-#endif /* CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR */
-
+#endif /* LVGL_PORT_AVOID_TEAR */
 
 static void update_callback(lv_disp_drv_t *drv)
 {
@@ -488,34 +453,28 @@ static void update_callback(lv_disp_drv_t *drv)
 
     switch (drv->rotated) {
     case LV_DISP_ROT_NONE:
-        // esp_lcd_panel_swap_xy(panel_handle, false);
-        // esp_lcd_panel_mirror(panel_handle, false, false);
-        panel.getLcd()->swapAxes(false);
-        panel.getLcd()->mirror(false, false);
+        esp_lcd_panel_swap_xy(panel_handle, false);
+        esp_lcd_panel_mirror(panel_handle, false, false);
         break;
     case LV_DISP_ROT_90:
-        // esp_lcd_panel_swap_xy(panel_handle, true);
-        // esp_lcd_panel_mirror(panel_handle, false, true);
-        panel.getLcd()->swapAxes(true);
-        panel.getLcd()->mirror(false, true);
+        esp_lcd_panel_swap_xy(panel_handle, true);
+        esp_lcd_panel_mirror(panel_handle, false, true);
         break;
     case LV_DISP_ROT_180:
-        // esp_lcd_panel_swap_xy(panel_handle, false);
-        // esp_lcd_panel_mirror(panel_handle, true, true);
-        panel.getLcd()->swapAxes(false);
-        panel.getLcd()->mirror(true, true);
+        esp_lcd_panel_swap_xy(panel_handle, false);
+        esp_lcd_panel_mirror(panel_handle, true, true);
         break;
     case LV_DISP_ROT_270:
-        // esp_lcd_panel_swap_xy(panel_handle, true);
-        // esp_lcd_panel_mirror(panel_handle, true, false);
-        panel.getLcd()->swapAxes(true);
-        panel.getLcd()->mirror(true, false);
+        esp_lcd_panel_swap_xy(panel_handle, true);
+        esp_lcd_panel_mirror(panel_handle, true, false);
         break;
     }
 }
 
-static lv_disp_t *display_init(void)
+static lv_disp_t *display_init(esp_lcd_panel_handle_t panel_handle)
 {
+    assert(panel_handle);
+
     static lv_disp_draw_buf_t disp_buf = { 0 };     // Contains internal graphic buffer(s) called draw buffer(s)
     static lv_disp_drv_t disp_drv = { 0 };          // Contains LCD panel handle and callback functions
 
@@ -525,53 +484,55 @@ static lv_disp_t *display_init(void)
     int buffer_size = 0;
 
     ESP_LOGD(TAG, "Malloc memory for LVGL buffer");
-#ifndef CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
+#if !LVGL_PORT_AVOID_TEAR
     // Normmaly, for RGB LCD, we just use one buffer for LVGL rendering
-    buffer_size = BSP_LCD_H_RES * LVGL_BUFFER_HEIGHT;
-    buf1 = heap_caps_malloc(buffer_size * sizeof(lv_color_t), LVGL_BUFFER_MALLOC);
-    BSP_NULL_CHECK(buf1, NULL);
-    ESP_LOGI(TAG, "LVGL buffer size: %dKB", buffer_size * sizeof(lv_color_t) / 1024);
+    buffer_size = LVGL_PORT_BUFFER_SIZE;
+    buf1 = heap_caps_malloc(buffer_size * sizeof(lv_color_t), LVGL_PORT_BUFFER_MALLOC_CAPS);
+    assert(buf1);
+    ESP_LOGD(TAG, "LVGL buffer size: %dKB", buffer_size * sizeof(lv_color_t) / 1024);
 #else
     // To avoid the tearing effect, we should use at least two frame buffers: one for LVGL rendering and another for RGB output
-    buffer_size = BSP_LCD_H_RES * BSP_LCD_V_RES;
-#if (CONFIG_BSP_LCD_RGB_BUFFER_NUMS == 3) && (CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE == 0) && CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH
+    buffer_size = LVGL_PORT_DISP_WIDTH * LVGL_PORT_DISP_HEIGHT;
+#if (LVGL_PORT_DISP_BUFFER_NUM >= 3) && (LVGL_PORT_ROTATION_DEGREE == 0) && LVGL_PORT_FULL_REFRESH
+
     // With the usage of three buffers and full-refresh, we always have one buffer available for rendering, eliminating the need to wait for the RGB's sync signal
-    lvgl_port_rgb_last_buf = panel.getLcd()->getRgbBufferByIndex(0);
-    buf1 = panel.getLcd()->getRgbBufferByIndex(1);
-    buf2 = panel.getLcd()->getRgbBufferByIndex(2);
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 3, &lvgl_port_rgb_last_buf, &buf1, &buf2));
     lvgl_port_rgb_next_buf = lvgl_port_rgb_last_buf;
     lvgl_port_flush_next_buf = buf2;
-#elif (CONFIG_BSP_LCD_RGB_BUFFER_NUMS == 3) && (CONFIG_BSP_DISPLAY_LVGL_ROTATION_DEGREE != 0)
+
+#elif (LVGL_PORT_DISP_BUFFER_NUM >= 3) && (LVGL_PORT_ROTATION_DEGREE != 0)
+
     // Here we are using three frame buffers, one for LVGL rendering, and the other two for RGB driver (one of them is used for rotation)
     void *fbs[3];
-    fbs[0] = panel.getLcd()->getRgbBufferByIndex(0);
-    fbs[1] = panel.getLcd()->getRgbBufferByIndex(1);
-    fbs[2] = panel.getLcd()->getRgbBufferByIndex(2);
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 3, &fbs[0], &fbs[1], &fbs[2]));
     buf1 = fbs[2];
-#else
-    buf1 = panel.getLcd()->getRgbBufferByIndex(0);
-    buf2 = panel.getLcd()->getRgbBufferByIndex(1);
+
+#elif LVGL_PORT_DISP_BUFFER_NUM >= 2
+
+    ESP_ERROR_CHECK(esp_lcd_rgb_panel_get_frame_buffer(panel_handle, 2, &buf1, &buf2));
+
 #endif
-#endif /* CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR */
+#endif /* LVGL_PORT_AVOID_TEAR */
 
     // initialize LVGL draw buffers
     lv_disp_draw_buf_init(&disp_buf, buf1, buf2, buffer_size);
 
     ESP_LOGD(TAG, "Register display driver to LVGL");
     lv_disp_drv_init(&disp_drv);
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_90 || CONFIG_BSP_DISPLAY_LVGL_ROTATION_270
-    disp_drv.hor_res = BSP_LCD_V_RES;
-    disp_drv.ver_res = BSP_LCD_H_RES;
+#if LVGL_PORT_ROTATION_90 || LVGL_PORT_ROTATION_270
+    disp_drv.hor_res = LVGL_PORT_DISP_HEIGHT;
+    disp_drv.ver_res = LVGL_PORT_DISP_WIDTH;
 #else
-    disp_drv.hor_res = BSP_LCD_H_RES;
-    disp_drv.ver_res = BSP_LCD_V_RES;
+    disp_drv.hor_res = LVGL_PORT_DISP_WIDTH;
+    disp_drv.ver_res = LVGL_PORT_DISP_HEIGHT;
 #endif
     disp_drv.flush_cb = flush_callback;
     disp_drv.drv_update_cb = update_callback;
     disp_drv.draw_buf = &disp_buf;
-#if CONFIG_BSP_DISPLAY_LVGL_FULL_REFRESH
+    disp_drv.user_data = panel_handle;
+#if LVGL_PORT_FULL_REFRESH
     disp_drv.full_refresh = 1;
-#elif CONFIG_BSP_DISPLAY_LVGL_DIRECT_MODE
+#elif LVGL_PORT_DIRECT_MODE
     disp_drv.direct_mode = 1;
 #endif
     return lv_disp_drv_register(&disp_drv);
@@ -579,42 +540,47 @@ static lv_disp_t *display_init(void)
 
 static void touchpad_read(lv_indev_drv_t *indev_drv, lv_indev_data_t *data)
 {
-    panel.getLcdTouch()->readData();
+    esp_lcd_touch_handle_t tp = (esp_lcd_touch_handle_t)indev_drv->user_data;
+    assert(tp);
 
-    bool touched = panel.getLcdTouch()->getLcdTouchState();
-    if(!touched) {
-        data->state = LV_INDEV_STATE_REL;
+    uint16_t touchpad_x;
+    uint16_t touchpad_y;
+    uint8_t touchpad_cnt = 0;
+    /* Read data from touch controller into memory */
+    esp_lcd_touch_read_data(tp);
+
+    /* Read data from touch controller */
+    bool touchpad_pressed = esp_lcd_touch_get_coordinates(tp, &touchpad_x, &touchpad_y, NULL, &touchpad_cnt, 1);
+    if (touchpad_pressed && touchpad_cnt > 0) {
+        data->point.x = touchpad_x;
+        data->point.y = touchpad_y;
+        data->state = LV_INDEV_STATE_PRESSED;
+        ESP_LOGD(TAG, "Touch position: %d,%d", touchpad_x, touchpad_y);
     } else {
-        TouchPoint point = panel.getLcdTouch()->getPoint();
-
-        data->state = LV_INDEV_STATE_PR;
-        /*Set the coordinates*/
-        data->point.x = point.x;
-        data->point.y = point.y;
-
-        // Serial.printf("Touch point: x %d, y %d\n", point.x, point.y);
+        data->state = LV_INDEV_STATE_RELEASED;
     }
 }
 
-static lv_indev_t *indev_init(void)
+static lv_indev_t *indev_init(esp_lcd_touch_handle_t tp)
 {
+    assert(tp);
+
     static lv_indev_drv_t indev_drv_tp;
 
     /* Register a touchpad input device */
     lv_indev_drv_init(&indev_drv_tp);
     indev_drv_tp.type = LV_INDEV_TYPE_POINTER;
     indev_drv_tp.read_cb = touchpad_read;
+    indev_drv_tp.user_data = tp;
 
     return lv_indev_drv_register(&indev_drv_tp);
 }
 
 #if !LV_TICK_CUSTOM
-#define LVGL_TICK_PERIOD_MS     (2)
-
 static void tick_increment(void *arg)
 {
     /* Tell LVGL how many milliseconds have elapsed */
-    lv_tick_inc(LVGL_TICK_PERIOD_MS);
+    lv_tick_inc(LVGL_PORT_TICK_PERIOD_MS);
 }
 
 static esp_err_t tick_init(void)
@@ -625,92 +591,85 @@ static esp_err_t tick_init(void)
         .name = "LVGL tick"
     };
     esp_timer_handle_t lvgl_tick_timer = NULL;
-    BSP_ERROR_CHECK_RETURN_ERR(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
-    return esp_timer_start_periodic(lvgl_tick_timer, LVGL_TICK_PERIOD_MS * 1000);
+    ESP_ERROR_CHECK(esp_timer_create(&lvgl_tick_timer_args, &lvgl_tick_timer));
+    return esp_timer_start_periodic(lvgl_tick_timer, LVGL_PORT_TICK_PERIOD_MS * 1000);
 }
 #endif
 
 static void lvgl_port_task(void *arg)
 {
-    ESP_LOGI(TAG, "Starting LVGL task");
+    ESP_LOGD(TAG, "Starting LVGL task");
     while (1) {
-        bsp_lvgl_port_lock(-1);
+        lvgl_port_lock(-1);
         uint32_t task_delay_ms = lv_timer_handler();
-        bsp_lvgl_port_unlock();
-        if (task_delay_ms > LVGL_TASK_MAX_DELAY_MS) {
-            task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
-        } else if (task_delay_ms < LVGL_TASK_MIN_DELAY_MS) {
-            task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
+        lvgl_port_unlock();
+        if (task_delay_ms > LVGL_PORT_TASK_MAX_DELAY_MS) {
+            task_delay_ms = LVGL_PORT_TASK_MAX_DELAY_MS;
+        } else if (task_delay_ms < LVGL_PORT_TASK_MIN_DELAY_MS) {
+            task_delay_ms = LVGL_PORT_TASK_MIN_DELAY_MS;
         }
         vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
     }
 }
 
-esp_err_t bsp_lvgl_port_init(lv_disp_t **disp_dev, lv_indev_t **input_dev)
+bool lvgl_port_init(ESP_PanelLcd *lcd, ESP_PanelTouch *tp)
 {
-    lv_disp_t *disp = NULL;
-    lv_indev_t *indev = NULL;
+    CHECK_FALSE_RET((lcd != nullptr) && (lcd->getHandle() != nullptr), false, "LCD device is not initialized");
+    CHECK_FALSE_RET((lcd->getBus()->getType() == ESP_PANEL_BUS_TYPE_RGB), false, "Only RGB support to avoid tearing");
+    CHECK_FALSE_RET((tp == nullptr) || (tp->getHandle() != nullptr), false, "Touch device is not initialized");
 
-    panel.init();
-    static_cast<ESP_PanelBus_RGB *>(panel.getLcd()->getBus())->setRgbFrameBufferCount(CONFIG_BSP_LCD_RGB_BUFFER_NUMS);
-    panel.begin();
+    esp_lcd_panel_handle_t lcd_handle = lcd->getHandle();
+    esp_lcd_touch_handle_t tp_handle = (tp) ? tp->getHandle() : nullptr;
 
     lv_init();
-
 #if !LV_TICK_CUSTOM
-    BSP_ERROR_CHECK_RETURN_ERR(tick_init());
+    CHECK_ERR_RET(tick_init(), false, "Initialize LVGL tick failed");
 #endif
 
-    BSP_NULL_CHECK(disp = display_init(), ESP_FAIL);
-    BSP_NULL_CHECK(indev = indev_init(), ESP_FAIL);
+    lv_disp_t *disp = display_init(lcd_handle);
+    CHECK_NULL_RET(disp, false, "Initialize LVGL display device failed");
 
-#if CONFIG_BSP_DISPLAY_LVGL_ROTATION_90
-    panel.getLcdTouch()->swapAxes(true);
-    panel.getLcdTouch()->mirrorX(true);
-#elif CONFIG_BSP_DISPLAY_LVGL_ROTATION_180
-    panel.getLcdTouch()->mirrorX(true);
-    panel.getLcdTouch()->mirrorY(true);
-#elif CONFIG_BSP_DISPLAY_LVGL_ROTATION_270
-    panel.getLcdTouch()->swapAxes(true);
-    panel.getLcdTouch()->mirrorY(true);
+    if (tp) {
+        lv_indev_t *indev = indev_init(tp_handle);
+        CHECK_NULL_RET(indev, false, "Initialize LVGL input device failed");
+
+#if LVGL_PORT_ROTATION_DEGREE == 90
+        esp_lcd_touch_set_swap_xy(tp_handle, true);
+        esp_lcd_touch_set_mirror_y(tp_handle, true);
+#elif LVGL_PORT_ROTATION_DEGREE == 180
+        esp_lcd_touch_set_mirror_x(tp_handle, true);
+        esp_lcd_touch_set_mirror_y(tp_handle, true);
+#elif LVGL_PORT_ROTATION_DEGREE == 270
+        esp_lcd_touch_set_swap_xy(tp_handle, true);
+        esp_lcd_touch_set_mirror_x(tp_handle, true);
 #endif
+    }
 
     lvgl_mux = xSemaphoreCreateRecursiveMutex();
-    BSP_NULL_CHECK(lvgl_mux, ESP_FAIL);
-    ESP_LOGI(TAG, "Create LVGL task");
-    BaseType_t core_id = (CONFIG_BSP_DISPLAY_LVGL_TASK_CORE_ID < 0) ? tskNO_AFFINITY : CONFIG_BSP_DISPLAY_LVGL_TASK_CORE_ID;
-    BaseType_t ret = xTaskCreatePinnedToCore(
-                         lvgl_port_task, "LVGL", CONFIG_BSP_DISPLAY_LVGL_TASK_STACK_SIZE_KB * 1024, NULL,
-                         CONFIG_BSP_DISPLAY_LVGL_TASK_PRIORITY, &lvgl_task_handle, core_id
-                     );
-    if (ret != pdPASS) {
-        ESP_LOGE(TAG, "Failed to create LVGL task");
-        return ESP_FAIL;
-    }
-#if CONFIG_BSP_DISPLAY_LVGL_AVOID_TEAR
-    panel.getLcd()->attachDrawBitmapFinishCallback(lcd_trans_done);
-#endif
+    CHECK_NULL_RET(lvgl_mux, false, "Create LVGL mutex failed");
 
-    if (disp_dev != NULL) {
-        *disp_dev = disp;
-    }
-    if (input_dev != NULL) {
-        *input_dev = indev;
-    }
+    ESP_LOGD(TAG, "Create LVGL task");
+    BaseType_t core_id = (LVGL_PORT_TASK_CORE < 0) ? tskNO_AFFINITY : LVGL_PORT_TASK_CORE;
+    BaseType_t ret = xTaskCreatePinnedToCore(lvgl_port_task, "lvgl", LVGL_PORT_TASK_STACK_SIZE, NULL,
+                     LVGL_PORT_TASK_PRIORITY, &lvgl_task_handle, core_id);
+    CHECK_FALSE_RET(ret == pdPASS, false, "Create LVGL task failed");
 
-    return ESP_OK;
+    return true;
 }
 
-bool bsp_lvgl_port_lock(int timeout_ms)
+bool lvgl_port_lock(int timeout_ms)
 {
-    assert(lvgl_mux && "bsp_lvgl_port_init must be called first");
+    CHECK_NULL_RET(lvgl_mux, false, "LVGL mutex is not initialized");
 
     const TickType_t timeout_ticks = (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-    return xSemaphoreTakeRecursive(lvgl_mux, timeout_ticks) == pdTRUE;
+    return (xSemaphoreTakeRecursive(lvgl_mux, timeout_ticks) == pdTRUE);
 }
 
-void bsp_lvgl_port_unlock(void)
+bool lvgl_port_unlock(void)
 {
-    assert(lvgl_mux && "bsp_lvgl_port_init must be called first");
+    CHECK_NULL_RET(lvgl_mux, false, "LVGL mutex is not initialized");
+
     xSemaphoreGiveRecursive(lvgl_mux);
+
+    return true;
 }

@@ -30,37 +30,41 @@
 //#include "demos/lv_demos.h"
 #include "doMain.h"
 #include <ESP_Panel_Library.h>
-#include "bsp_lvgl_port.h"
+#include "lvgl_port.h"
 
-void tcr1s()
+#if LVGL_PORT_AVOID_TEAR
+IRAM_ATTR bool onRefreshFinishCallback(void *user_data)
 {
-  Serial.printf("SRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-  Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    return lvgl_port_notify_rgb_vsync();
 }
+#endif
 
 void setup()
 {
   Serial.begin(115200);
 
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  Serial.printf("SRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-  Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-
   // while (!Serial);
   Serial.println("LVGL Widgets Demo");
 
-  bsp_lvgl_port_init(NULL, NULL);
+  ESP_Panel *panel = new ESP_Panel();
+  panel->init();
+  ESP_PanelBus_RGB *rgb_bus = static_cast<ESP_PanelBus_RGB *>(panel->getLcd()->getBus());
+  rgb_bus->configRgbFrameBufferNumber(LVGL_PORT_DISP_BUFFER_NUM);
+  panel->begin();
 
-  bsp_lvgl_port_lock(-1);
+  Serial.println("Initialize LVGL");
+  lvgl_port_init(panel->getLcd(), panel->getTouch());
+#if LVGL_PORT_AVOID_TEAR
+  panel->getLcd()->attachRefreshFinishCallback(onRefreshFinishCallback, NULL);
+#endif
+
+  lvgl_port_lock(-1);
+
   // lv_demo_widgets();
   // lv_demo_benchmark();
   ui_main();
-  bsp_lvgl_port_unlock();
 
-  Serial.println("Setup done");
-  Serial.printf("SRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
-  Serial.printf("PSRAM free size: %d\n", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+  lvgl_port_unlock();
 }
 
 void loop()
