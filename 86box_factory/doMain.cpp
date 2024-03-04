@@ -282,7 +282,7 @@ void connect_wifi_task(void *pvParameters)
         delay(1000);
         _ui_screen_change(&ui_Screen1, LV_SCR_LOAD_ANIM_FADE_ON, 500, 0, &ui_Screen1_screen_init);
         xTaskCreatePinnedToCore(getNtpTime, "getNtpTime", 4096, NULL, 1, NULL, 1);
-        xTaskCreatePinnedToCore(getWeather, "getWeather", 4096, NULL, 1, NULL, 1);
+        xTaskCreatePinnedToCore(getWeather, "getWeather", 6 * 1024, NULL, 1, NULL, 1);
     }
     else
     {
