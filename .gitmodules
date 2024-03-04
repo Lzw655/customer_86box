@@ -1,0 +1,3 @@
+[submodule "libraries/ESP32_Display_Panel"]
+	path = libraries/ESP32_Display_Panel
+	url = https://github.com/esp-arduino-libs/ESP32_Display_Panel.git
