@@ -22,7 +22,7 @@
 #define LVGL_PORT_TASK_MIN_DELAY_MS             (2)
 #define LVGL_PORT_TASK_STACK_SIZE               (6 * 1024)
 #define LVGL_PORT_TASK_PRIORITY                 (2)
-#define LVGL_PORT_TASK_CORE                     (-1)
+#define LVGL_PORT_TASK_CORE                     (1)
 
 /* Avoid tering related configurations */
 // Mode Type, don't change these
